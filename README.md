@@ -71,8 +71,8 @@ Model trains on public datasets — they keep their own licenses:
 
 ## License
 
-Code is MIT — see [LICENSE](LICENSE). If you use the datasets above, follow their licenses too (attribution, basically).
+Code is MIT — see [LICENSE](LICENSE).
 
 <p align="center">
-  Built with <3 and a lot of bad decisions! by <a href="https://ranveersoni.me">ranveersoni98</a>
+  Built with <3 and a lot of bad decisions! by <a href="https://ranveersoni.me">Ranveer Soni</a>
 </p>
