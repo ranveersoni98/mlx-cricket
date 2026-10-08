@@ -29,24 +29,24 @@ Tests get three-way output since draws are real:
 
 ## How it works
 
-Two stages. A winner model (MLX MLP + gradient-boosting sidecar, blended) predicts who wins *given* a decisive game. For Tests, a small logistic regression predicts P(draw) from tier, venue draw-rate, mismatch size, and year. Everything is pre-match only — no score leakage.
+Two stages. A winner model (MLX MLP + gradient-boosting sidecar, combined by a stacking classifier) predicts who wins *given* a decisive game. For Tests, a small logistic regression predicts P(draw) from tier, venue draw-rate, mismatch size, and year. Everything is pre-match only — no score leakage.
 
-Features are all chronological: Elo, last-5 form, head-to-head, venue and toss numbers, plus team/venue/format embeddings. Splits are walk-forward (train ≤2021, val 2022–23, test 2024–26), so the numbers below are honest.
+Features are all chronological: Elo (with proper IPL home cities), last-5 form, head-to-head, venue and toss numbers, rest days, season, plus team/venue/format embeddings. The MLP also trains on victory margins as an auxiliary target. Splits are walk-forward (train ≤2021, val 2022–23, test 2024–26), so the numbers below are honest. The MLP is trained over 5 seeds and stacked with the booster.
 
 ## Accuracy (test set, 2024–26)
 
 | Slice | Acc |
 |---|---|
-| Overall (ensemble) | 63.3% |
-| International | 70.0% |
-| Women's | 66.3% |
-| T20 | 64.5% |
-| ODI | 59.4% |
-| Test (decisive) | 59.5% |
-| Test (win/loss/draw) | 42.4% |
-| Domestic/club | 56.3% |
+| Overall (stacked ensemble) | 63.6% |
+| International | 70.8% |
+| Women's | 67.6% |
+| T20 | 64.9% |
+| ODI | 60.5% |
+| Test (decisive) | 57.4% |
+| Test (win/loss/draw) | 41.6% |
+| Domestic/club | 56.2% |
 
-Club cricket and draws are the weak spots — thin data and rain, respectively. The honest numbers are in `artifacts/metrics.json` after training.
+Club cricket and draws are the weak spots thin data and rain, respectively. The honest numbers are in `artifacts/metrics.json` after training.
 
 ## Layout
 

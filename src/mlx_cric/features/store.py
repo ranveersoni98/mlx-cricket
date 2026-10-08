@@ -13,7 +13,7 @@ UNK = "__UNK__"
 
 NUMERIC_COLS = ["elo_diff", "abs_elo_diff", "elo_win_prob", "year", "toss1",
                 "form_diff", "h2h", "venue_edge", "toss_venue",
-                "star_diff", "exp_diff", "draw_venue"]
+                "star_diff", "exp_diff", "draw_venue", "rest_diff"]
 
 
 class Vocab:
@@ -107,7 +107,7 @@ class FeatureStore:
         tr = np.array([self.tier.encode(x) for x in (df["tier"] if "tier" in df else df["format"])], dtype=np.int32)
         def std_col(name: str, default: float) -> npt.NDArray[np.float32]:
             if name in df:
-                v = df[name].values.astype(np.float32)
+                v = np.asarray(df[name].to_numpy(dtype=np.float32), dtype=np.float32)
             else:
                 v = np.full(n, default, np.float32)
             m = self.num_mean.get(name, 0.0 if default != 0.5 else 0.0)
@@ -115,27 +115,36 @@ class FeatureStore:
             if name in ("elo_win_prob", "h2h", "toss_venue"):
                 return v.astype(np.float32)  # already [0,1], keep raw
             return ((v - m) / s).astype(np.float32)
+        def raw_f32(name: str, default: float) -> npt.NDArray[np.float32]:
+            # already in [0,1] — keep raw, no standardization
+            if name in df:
+                return np.asarray(df[name].to_numpy(dtype=np.float32), dtype=np.float32)
+            return np.full(n, default, dtype=np.float32)
         elo = std_col("elo_diff", 0.0)
         abs_elo = std_col("abs_elo_diff", 0.0)
-        eprob = df["elo_win_prob"].values.astype(np.float32) if "elo_win_prob" in df else np.full(n, 0.5, np.float32)
-        year = ((df["year"].values.astype(np.float32) - self.year_min) / max(1, self.year_max - self.year_min)).astype(np.float32)
+        eprob = raw_f32("elo_win_prob", 0.5)
+        year = ((raw_f32("year", float(self.year_min)) - self.year_min) / max(1, self.year_max - self.year_min)).astype(np.float32)
         # toss from team1's view: +1 won it, -1 lost it, 0 unknown
-        toss_side = df["toss_side"].values
+        toss_side = np.asarray(df["toss_side"].to_numpy(dtype=str))
         toss1 = np.where(toss_side == "team1", 1.0, np.where(toss_side == "team2", -1.0, 0.0)).astype(np.float32)
         form_diff = std_col("form_diff", 0.0)
-        h2h_v = df["h2h"].values.astype(np.float32) if "h2h" in df else np.full(n, 0.5, np.float32)
+        h2h_v = raw_f32("h2h", 0.5)
         vedge = std_col("venue_edge", 0.0)
-        tven = df["toss_venue"].values.astype(np.float32) if "toss_venue" in df else np.full(n, 0.5, np.float32)
+        tven = raw_f32("toss_venue", 0.5)
         star = std_col("star_diff", 0.0)
         expd = std_col("exp_diff", 0.0)
-        drw_v = df["draw_venue"].values.astype(np.float32) if "draw_venue" in df else np.full(n, 0.3, np.float32)
-        y = df["label"].values.astype(np.int32) if "label" in df else np.zeros(n, np.int32)
+        drw_v = raw_f32("draw_venue", 0.3)
+        rest_d = std_col("rest_diff", 0.0)
+        msin = raw_f32("month_sin", 0.0)
+        mcos = raw_f32("month_cos", 1.0)
+        y = np.asarray(df["label"].to_numpy(dtype=np.int32), dtype=np.int32) if "label" in df else np.zeros(n, np.int32)
         return {
             "t1": t1, "t2": t2, "country": co, "city": ci, "fmt": fm,
             "toss_side": ts, "toss_choice": tc, "gender": gd, "team_type": tt, "tier": tr,
             "elo": elo, "abs_elo": abs_elo, "elo_prob": eprob, "year": year, "toss1": toss1,
             "form_diff": form_diff, "h2h": h2h_v, "venue_edge": vedge,
-            "toss_venue": tven, "star_diff": star, "exp_diff": expd, "draw_venue": drw_v, "y": y,
+            "toss_venue": tven, "star_diff": star, "exp_diff": expd, "draw_venue": drw_v,
+            "rest_diff": rest_d, "month_sin": msin, "month_cos": mcos, "y": y,
         }
 
     def to_json(self) -> dict[str, Any]:

@@ -100,6 +100,16 @@ def _city_draw_rate(city: str, df_hist: pd.DataFrame) -> float:
     return (w + 1.5) / (len(d) + 5.0)
 
 
+def _days_rest(team: str, at: pd.Timestamp, df_hist: pd.DataFrame) -> float:
+    d = df_hist[(df_hist["team1"] == team) | (df_hist["team2"] == team)]
+    if not len(d):
+        return 30.0
+    last = pd.to_datetime(d["date"], errors="coerce").max()
+    if pd.isna(last):
+        return 30.0
+    return max(0.0, min(60.0, (at - last).days))
+
+
 def split_venue(venue: str) -> tuple[str, str]:
     """'Dubai International Cricket Stadium, Dubai' -> (stadium, city)."""
     parts = [p.strip() for p in str(venue or "").split(",") if p.strip()]
@@ -120,21 +130,28 @@ class Predictor:
             _cfg = _json.loads((self.artifacts / "model_config.json").read_text())
             _team_dim, _ncls = int(_cfg.get("team_dim", 16)), int(_cfg.get("n_classes", 2))
             self.hgb_keys: list[str] = list(_cfg.get("hgb_keys", []))
+            _n_seeds = int(_cfg.get("n_seeds", 1))
         except Exception:
-            _team_dim, _ncls = 16, 2
+            _team_dim, _ncls, _n_seeds = 16, 2, 1
             self.hgb_keys = []
-        self.model = CricketMLP(
-            n_teams=len(self.fs.teams), n_country=len(self.fs.country),
-            n_city=len(self.fs.city), n_fmt=len(self.fs.format),
-            n_toss_side=max(4, len(self.fs.toss_side)),
-            n_toss_choice=max(4, len(self.fs.toss_choice)),
-            n_gender=max(3, len(getattr(self.fs, "gender", [0, 1]))),
-            n_team_type=max(3, len(getattr(self.fs, "team_type", [0, 1]))),
-            n_tier=max(8, len(getattr(self.fs, "tier", [0] * 8))),
-            team_dim=_team_dim, n_classes=_ncls,
-        )
-        self.model.load_weights(str(self.artifacts / "model.safetensors"))
-        self.model.eval()
+        self.models: list[CricketMLP] = []
+        for _s in range(_n_seeds):
+            _m = CricketMLP(
+                n_teams=len(self.fs.teams), n_country=len(self.fs.country),
+                n_city=len(self.fs.city), n_fmt=len(self.fs.format),
+                n_toss_side=max(4, len(self.fs.toss_side)),
+                n_toss_choice=max(4, len(self.fs.toss_choice)),
+                n_gender=max(3, len(getattr(self.fs, "gender", [0, 1]))),
+                n_team_type=max(3, len(getattr(self.fs, "team_type", [0, 1]))),
+                n_tier=max(8, len(getattr(self.fs, "tier", [0] * 8))),
+                team_dim=_team_dim, n_classes=_ncls,
+            )
+            _wf = self.artifacts / f"model_{_s}.safetensors"
+            if not _wf.exists():
+                _wf = self.artifacts / "model.safetensors"
+            _m.load_weights(str(_wf))
+            _m.eval()
+            self.models.append(_m)
         try:
             tp = self.artifacts / "temperature.json"
             self.temperature = float(_json.loads(tp.read_text())["temperature"]) if tp.exists() else 1.0
@@ -142,6 +159,7 @@ class Predictor:
             self.temperature = 1.0
         self.hgb: Any = None
         self.draw_lr: Any = None
+        self.stacker: Any = None
         self.w_mlp: float = 1.0
         try:
             with open(self.artifacts / "hgb.pkl", "rb") as _f:
@@ -155,6 +173,19 @@ class Predictor:
                 self.draw_lr = _pickle.load(_f)
         except Exception:
             pass
+        try:
+            with open(self.artifacts / "stacker.pkl", "rb") as _f:
+                self.stacker = _pickle.load(_f)
+        except Exception:
+            pass
+        try:
+            _rt = _json.loads((self.artifacts / "ratings.json").read_text())
+            self.ratings_map: dict[tuple[str, str], tuple[float, float]] = {}
+            for _k, _v in _rt.items():
+                _t, _, _g = _k.partition("||")
+                self.ratings_map[(str(_t), str(_g))] = (float(_v["bat"]), float(_v["bowl"]))
+        except Exception:
+            self.ratings_map = {}
         try:
             self.hist = _history_snapshot()
             self.elo_map = _elo_lookup(self.hist)
@@ -173,12 +204,18 @@ class Predictor:
         toss_choice: str = "none",
         fmt: str = "T20",
         year: int | None = None,
+        month: int | None = None,
         gender: str | None = None,
         team_type: str | None = None,
     ) -> pd.DataFrame:
+        import math as _math
         from datetime import datetime, timezone as _tz
+        now = datetime.now(_tz.utc).replace(tzinfo=None)
         team1, team2 = normalize_team(team1), normalize_team(team2)
-        year = year or datetime.now(_tz.utc).year
+        year = year or now.year
+        month = month or now.month
+        msin, mcos = _math.sin(2 * _math.pi * month / 12.0), _math.cos(2 * _math.pi * month / 12.0)
+        at = pd.Timestamp(now)
         # auto-detect women's + domestic/club when not given
         if gender is None:
             gender = "female" if ("women" in team1.lower() or "women" in team2.lower()) else "male"
@@ -201,12 +238,17 @@ class Predictor:
             vedge = _city_rate(team1, venue_city, self.hist) - _city_rate(team2, venue_city, self.hist)
             tven = _city_toss_rate(venue_city, self.hist)
             drw_v = _city_draw_rate(venue_city, self.hist)
+            rstd = max(-30.0, min(30.0, _days_rest(team1, at, self.hist) - _days_rest(team2, at, self.hist))) / 30.0
         else:
             f1 = f2 = 0.5
             h = 0.5
             vedge = 0.0
             tven = 0.5
             drw_v = 0.3
+            rstd = 0.0
+        fg = {"ODI": "ODI", "T20": "T20", "TEST": "MULTI"}.get(fmt, fmt)
+        b1, w1 = self.ratings_map.get((team1, fg), (0.0, 0.0))
+        b2, w2 = self.ratings_map.get((team2, fg), (0.0, 0.0))
         df = pd.DataFrame([{
             "team1": team1, "team2": team2,
             "venue_stadium": venue_stadium, "venue_city": venue_city,
@@ -216,6 +258,7 @@ class Predictor:
             "gender": gender, "team_type": team_type, "tier": tier,
             "form_diff": f1 - f2, "h2h": h, "venue_edge": vedge,
             "toss_venue": tven, "star_diff": 0.0, "exp_diff": 0.0, "draw_venue": drw_v,
+            "rest_diff": rstd, "month_sin": msin, "month_cos": mcos,
         }])
         return df
 
@@ -250,14 +293,25 @@ class Predictor:
         df = self._frame(team1, team2, **kw)
         arr = self.fs.transform(df)
         batch = {k: mx.array(v) for k, v in arr.items()}
-        logits = self.model(batch)
-        mx.eval(logits)
-        l = np.array(logits) / max(0.05, self.temperature)
+        seed_logits: list[npt.NDArray[np.float64]] = []
+        for _m in self.models:
+            _lg = _m(batch)
+            mx.eval(_lg)
+            seed_logits.append(np.array(_lg, dtype=np.float64))
+        logits = np.mean(seed_logits, axis=0)
+        l = logits / max(0.05, self.temperature)
         e = np.exp(l - l.max(axis=1, keepdims=True))
-        probs = e / e.sum(axis=1, keepdims=True)
+        mlp_p = e / e.sum(axis=1, keepdims=True)
         hgb_p = self._hgb_proba(arr)
+        probs = mlp_p
         if hgb_p is not None:
-            probs = self.w_mlp * probs + (1 - self.w_mlp) * hgb_p
+            if self.stacker is not None:
+                import numpy as _np2
+                elo1 = float(_np2.asarray(arr["elo_prob"])[0])
+                X = _np2.array([[float(mlp_p[0][1]), float(hgb_p[0][1]), elo1]])
+                probs = _np2.asarray(self.stacker["model"].predict_proba(X), dtype=float)
+            else:
+                probs = self.w_mlp * mlp_p + (1 - self.w_mlp) * hgb_p
         p = probs[0]
         row = df.iloc[0]
         out: dict[str, Any] = {
@@ -297,11 +351,13 @@ class Predictor:
             )
             stadium, city = split_venue(str(f.get("venue", "") or ""))
             venue_country = infer_country(city, stadium)
+            dt = pd.to_datetime(f.get("date"), errors="coerce")
             try:
                 out.append(self.predict_proba(
                     str(f["team1"]), str(f["team2"]),
                     venue_country=venue_country, venue_city=city, venue_stadium=stadium,
                     fmt=fmt, year=datetime.now(timezone.utc).year,
+                    month=int(dt.month) if not pd.isna(dt) else None,
                 ) | {"status": f.get("status"), "match_type": f.get("match_type"),
                      "date": f.get("date"), "venue": f.get("venue")})
             except Exception as e:

@@ -14,8 +14,9 @@ def main() -> None:
     t.add_argument("--batch-size", type=int, default=512)
     t.add_argument("--lr", type=float, default=3e-3)
     t.add_argument("--label-smoothing", type=float, default=0.05)
-    t.add_argument("--patience", type=int, default=6)
+    t.add_argument("--patience", type=int, default=8)
     t.add_argument("--team-dim", type=int, default=32)
+    t.add_argument("--seeds", type=int, default=5)
     t.add_argument("--no-baseline", action="store_true")
     t.add_argument("--rebuild", action="store_true")
 
@@ -43,7 +44,7 @@ def main() -> None:
         from .training import train
         hist = train(epochs=a.epochs, batch_size=a.batch_size, lr=a.lr,
                      label_smoothing=a.label_smoothing, patience=a.patience,
-                     team_dim=a.team_dim, force_rebuild=a.rebuild,
+                     team_dim=a.team_dim, n_seeds=a.seeds, force_rebuild=a.rebuild,
                      run_baseline=not a.no_baseline)
         print(json.dumps(hist, indent=2))
     elif a.cmd == "predict":

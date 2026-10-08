@@ -20,8 +20,8 @@ class CricketMLP(nn.Module):
         team_dim: int = 32,
         cat_dim: int = 8,
         n_classes: int = 2,
-        hidden: tuple[int, ...] = (128, 64, 32),
-        dropout: float = 0.2,
+        hidden: tuple[int, ...] = (256, 128, 64),
+        dropout: float = 0.3,
     ):
         super().__init__()
         self.team_emb = nn.Embedding(n_teams, team_dim)
@@ -34,20 +34,23 @@ class CricketMLP(nn.Module):
         self.ttype_emb = nn.Embedding(max(2, n_team_type), 4)
         self.tier_emb = nn.Embedding(max(2, n_tier), 4)
 
-        n_num = 12  # + abs_elo_diff (mismatch size), draw_venue (draw prior)
+        n_num = 15  # + month_sin/cos (seasonality)
         in_dim = team_dim * 2 + cat_dim * 3 + 4 * 2 + 4 + 4 + 4 + n_num
-        layers: list = []
+        layers: list[nn.Module] = []
         prev = in_dim
         for h in hidden:
             layers.append(nn.Linear(prev, h))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             prev = h
-        layers.append(nn.Linear(prev, n_classes))
-        self.mlp = nn.Sequential(*layers)
+        self.trunk = nn.Sequential(*layers)
+        self.head = nn.Linear(prev, n_classes)
+        # auxiliary: standardized victory margin (runs/wickets dominance).
+        # Trains on how teams win, not just who — richer gradient. Ignored at inference.
+        self.margin_head = nn.Linear(prev, 1)
         self.n_classes = n_classes
 
-    def __call__(self, batch: dict[str, mx.array]) -> mx.array:
+    def _features(self, batch: dict[str, mx.array]) -> mx.array:
         t1 = self.team_emb(batch["t1"])
         t2 = self.team_emb(batch["t2"])
         co = self.country_emb(batch["country"])
@@ -69,12 +72,20 @@ class CricketMLP(nn.Module):
                 col("elo", 0.0), col("abs_elo", 0.0), col("elo_prob", 0.5), col("year", 0.5), col("toss1", 0.0),
                 col("form_diff", 0.0), col("h2h", 0.5), col("venue_edge", 0.0),
                 col("toss_venue", 0.5), col("star_diff", 0.0), col("exp_diff", 0.0),
-                col("draw_venue", 0.3),
+                col("draw_venue", 0.3), col("rest_diff", 0.0),
+                col("month_sin", 0.0), col("month_cos", 1.0),
             ],
             axis=-1,
         )
         x = mx.concatenate([t1, t2, co, ci, fm, ts, tc, gd, tt, tr, num], axis=-1)
-        return self.mlp(x)
+        return x
+
+    def __call__(self, batch: dict[str, mx.array]) -> mx.array:
+        return self.head(self.trunk(self._features(batch)))
+
+    def margin(self, batch: dict[str, mx.array]) -> mx.array:
+        """Auxiliary dominance head. Same trunk, only used in training loss."""
+        return self.margin_head(self.trunk(self._features(batch)))
 
 
 def accuracy(logits: mx.array, y: mx.array) -> mx.array:

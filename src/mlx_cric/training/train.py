@@ -27,6 +27,7 @@ Arrays = dict[str, npt.NDArray[Any]]
 HGB_KEYS: list[str] = [
     "elo", "abs_elo", "elo_prob", "year", "toss1", "form_diff", "h2h",
     "venue_edge", "toss_venue", "star_diff", "exp_diff", "draw_venue",
+    "rest_diff", "month_sin", "month_cos",
     "t1", "t2", "country", "city", "fmt", "toss_side",
     "toss_choice", "gender", "team_type", "tier",
 ]
@@ -89,7 +90,7 @@ def log_loss_and_brier(probs: npt.NDArray[np.float64], y: npt.NDArray[Any]) -> t
 
 def slice_metrics(df: pd.DataFrame, probs: npt.NDArray[np.float64], pred: npt.NDArray[Any]) -> dict[str, dict[str, float | int]]:
     out: dict[str, dict[str, float | int]] = {}
-    y = np.asarray(df["label"].values)
+    y = np.asarray(df["label"].to_numpy())
     for col in ["format", "gender", "team_type"]:
         if col not in df:
             continue
@@ -117,16 +118,19 @@ def train_hgb(Atr: Arrays, Ava: Arrays, Ate: Arrays) -> tuple[Any, float, npt.ND
 DRAW_FEATS = ["tier_mdm", "draw_venue", "abs_elo", "year"]
 
 
+def _fcol(frame: pd.DataFrame, name: str, default: float) -> npt.NDArray[np.float64]:
+    if name in frame:
+        s = pd.to_numeric(frame[name], errors="coerce").fillna(default)
+        return np.asarray(s.to_numpy(dtype=np.float64), dtype=np.float64)
+    return np.full(len(frame), default, dtype=np.float64)
+
+
 def draw_features(d: pd.DataFrame) -> tuple[npt.NDArray[np.float64], npt.NDArray[Any]]:
     """Small, robust draw-signal columns (a 500-tree HGB overfit these; LogReg transfers)."""
     t = d[d["format"] == "TEST"].reset_index(drop=True)
-    X = np.column_stack([
-        (t["tier"].values == "MDM").astype(float),
-        t["draw_venue"].values.astype(float) if "draw_venue" in t else np.full(len(t), 0.3),
-        t["abs_elo_diff"].values.astype(float) if "abs_elo_diff" in t else np.zeros(len(t)),
-        t["year"].values.astype(float),
-    ])
-    return X, (t["label"].values == 2).astype(int)
+    tier = (np.asarray(t["tier"].to_numpy(dtype=str)) == "MDM").astype(np.float64)
+    X = np.column_stack([tier, _fcol(t, "draw_venue", 0.3), _fcol(t, "abs_elo_diff", 0.0), _fcol(t, "year", 2000.0)])
+    return X, (np.asarray(t["label"].to_numpy(dtype=np.int64)) == 2).astype(np.int64)
 
 
 def train_draw_hgb(
@@ -184,8 +188,73 @@ def draw_proba_bundle(bundle: Any, X: npt.NDArray[np.float64]) -> npt.NDArray[np
     return np.asarray(bundle["model"].predict_proba(bundle["scaler"].transform(X))[:, 1], dtype=float)
 
 
-def tune_ensemble_weight(
-    mlp_val: npt.NDArray[np.float64], hgb_val: npt.NDArray[np.float64], y: npt.NDArray[Any]
+def three_way_predictions(
+    frame: pd.DataFrame,
+    fs: FeatureStore,
+    seed_models: list[CricketMLP],
+    temp: float,
+    draw_bundle: Any,
+    thr: float,
+    hgb: Any = None,
+    w_mlp: float = 1.0,
+) -> npt.NDArray[np.int64]:
+    """Win/loss/draw predictions for TEST rows. Single implementation used by
+    train-time tuning, test reporting, and evaluate — so the numbers agree."""
+    Xd, _ = draw_features(frame)
+    draw_p = draw_proba_bundle(draw_bundle, Xd)
+    dec_pos = np.where(frame["label"].values != 2)[0]
+    win_argmax = np.zeros(len(frame), dtype=int)
+    if len(dec_pos):
+        dec = frame.iloc[dec_pos]
+        Ad = fs.transform(dec)
+        seed_ps: list[npt.NDArray[np.float64]] = []
+        for sm in seed_models:
+            lg = sm(to_mx(Ad))
+            mx.eval(lg)
+            seed_ps.append(softmax(np.array(lg, dtype=np.float64), temp))
+        mlp_p = np.mean(seed_ps, axis=0)
+        if hgb is not None:
+            hgb_p: npt.NDArray[np.float64] = hgb.predict_proba(to_hgb_matrix(Ad))
+            mlp_p = w_mlp * mlp_p + (1 - w_mlp) * hgb_p
+        win_argmax[dec_pos] = mlp_p.argmax(axis=1)
+    return np.where(draw_p >= thr, 2, win_argmax).astype(np.int64)
+
+
+def fit_margin_stats(tr: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Per-format mean/std of victory margins (runs + wickets separately)."""
+    stats: dict[str, dict[str, float]] = {}
+    for fmt, d in tr.groupby("format"):
+        runs = pd.to_numeric(d["win_by_runs"], errors="coerce").dropna() if "win_by_runs" in d else pd.Series([], dtype=float)
+        wkts = pd.to_numeric(d["win_by_wickets"], errors="coerce").dropna() if "win_by_wickets" in d else pd.Series([], dtype=float)
+        stats[str(fmt)] = {
+            "runs_mean": float(runs.mean()) if len(runs) else 50.0,
+            "runs_std": float(runs.std() or 50.0) if len(runs) else 50.0,
+            "wkts_mean": float(wkts.mean()) if len(wkts) else 5.0,
+            "wkts_std": float(wkts.std() or 3.0) if len(wkts) else 3.0,
+        }
+    return stats
+
+
+def attach_margin(frame: pd.DataFrame, stats: dict[str, dict[str, float]]) -> npt.NDArray[np.float64]:
+    """Signed, format-standardized dominance target (+ = team1 dominated).
+
+    Rows without margin data get target 0 — the loss masks them out.
+    """
+    y2 = np.zeros(len(frame))
+    w2 = np.zeros(len(frame))
+    for i, (_, r) in enumerate(frame.iterrows()):
+        st = stats.get(str(r["format"]), {"runs_mean": 50.0, "runs_std": 50.0, "wkts_mean": 5.0, "wkts_std": 3.0})
+        sign = 1.0 if r["label"] == 0 else -1.0
+        runs = pd.to_numeric(pd.Series([r.get("win_by_runs")]), errors="coerce").iloc[0]
+        wkts = pd.to_numeric(pd.Series([r.get("win_by_wickets")]), errors="coerce").iloc[0]
+        if pd.notna(runs):
+            y2[i], w2[i] = sign * (float(runs) - st["runs_mean"]) / st["runs_std"], 1.0
+        elif pd.notna(wkts):
+            y2[i], w2[i] = sign * (float(wkts) - st["wkts_mean"]) / st["wkts_std"], 1.0
+    return np.stack([y2, w2], axis=1)
+
+
+def tune_ensemble_weight(    mlp_val: npt.NDArray[np.float64], hgb_val: npt.NDArray[np.float64], y: npt.NDArray[Any]
 ) -> float:
     yi = np.asarray(y).astype(int)
     best_w, best_ll = 0.5, float("inf")
@@ -202,8 +271,10 @@ def train(
     batch_size: int = 512,
     lr: float = 3e-3,
     label_smoothing: float = 0.05,
-    patience: int = 6,
+    patience: int = 8,
     team_dim: int = 16,
+    n_seeds: int = 5,
+    weight_decay: float = 1e-4,
     force_rebuild: bool = False,
     run_baseline: bool = True,
     artifacts: Path = ARTIFACTS_DIR,
@@ -219,6 +290,13 @@ def train(
         raise RuntimeError("Empty dataset — check HF downloads.")
     n_draws = int((df["label"] == 2).sum()) if "label" in df else 0
     print(f"draws in frame: {n_draws} (two-stage draw model, not dropped)")
+    from ..data.ratings import add_rating_features, build_ratings, latest_ratings
+    print("building ball-by-ball team ratings...")
+    ratings = build_ratings()
+    df = add_rating_features(df, ratings)
+    latest = latest_ratings(ratings)
+    (artifacts / "ratings.json").write_text(json.dumps(
+        {f"{t}||{g}": {"bat": b, "bowl": w} for (t, g), (b, w) in latest.items()}, indent=2))
     save_processed(df, PROCESSED_DIR / "matches_unified_draws.csv")
     df = add_chrono_features(df)
 
@@ -238,49 +316,62 @@ def train(
     fs = FeatureStore().fit(tr)
     fs.save(artifacts / "features.json")
     Atr, Ava, Ate = (fs.transform(d) for d in (tr, va, te))
+    margin_stats = fit_margin_stats(tr)
+    (artifacts / "margin_stats.json").write_text(json.dumps(margin_stats, indent=2))
+    Atr["y2"], Ava["y2"], Ate["y2"] = (attach_margin(d, margin_stats) for d in (tr, va, te))
     print("train label balance:", tr["label"].value_counts(normalize=True).to_dict())
     print("formats:", tr["format"].value_counts().to_dict())
 
     n_classes = int(fair["label"].nunique())
     (artifacts / "model_config.json").write_text(json.dumps(
-        {"team_dim": team_dim, "n_classes": n_classes, "hgb_keys": HGB_KEYS}, indent=2))
-    model = CricketMLP(
-        n_teams=len(fs.teams), n_country=len(fs.country),
-        n_city=len(fs.city), n_fmt=len(fs.format),
-        n_toss_side=max(4, len(fs.toss_side)), n_toss_choice=max(4, len(fs.toss_choice)),
-        n_gender=max(3, len(fs.gender)), n_team_type=max(3, len(fs.team_type)),
-        n_tier=max(8, len(fs.tier)),
-        team_dim=team_dim, n_classes=n_classes,
-    )
-    mx.eval(model.parameters())
-    opt = optim.Adam(learning_rate=lr)
+        {"team_dim": team_dim, "n_classes": n_classes, "hgb_keys": HGB_KEYS,
+         "n_seeds": n_seeds}, indent=2))
+
+    def make_model() -> CricketMLP:
+        m = CricketMLP(
+            n_teams=len(fs.teams), n_country=len(fs.country),
+            n_city=len(fs.city), n_fmt=len(fs.format),
+            n_toss_side=max(4, len(fs.toss_side)), n_toss_choice=max(4, len(fs.toss_choice)),
+            n_gender=max(3, len(fs.gender)), n_team_type=max(3, len(fs.team_type)),
+            n_tier=max(8, len(fs.tier)),
+            team_dim=team_dim, n_classes=n_classes,
+        )
+        mx.eval(m.parameters())
+        return m
 
     def loss_fn(
         m: CricketMLP, b: dict[str, mx.array]
     ) -> tuple[mx.array, mx.array]:
+        from mlx.utils import tree_flatten
         logits = m(b)
         if label_smoothing and n_classes == 2:
             # manual smoothing: y_s = (1-eps)*onehot + eps/K
             logp = nn.log_softmax(logits, axis=-1)
             ce = nn.losses.cross_entropy(logits, b["y"], reduction="none")
             smooth_loss = -logp.mean(axis=-1)
-            loss = ((1 - label_smoothing) * ce + label_smoothing * smooth_loss).mean()
-            return loss, logits
-        ce_mean = nn.losses.cross_entropy(logits, b["y"], reduction="mean")
-        return ce_mean, logits
+            ce_loss = ((1 - label_smoothing) * ce + label_smoothing * smooth_loss).mean()
+        else:
+            ce_loss = nn.losses.cross_entropy(logits, b["y"], reduction="mean")
+        # auxiliary dominance: how teams win, masked where margin unknown
+        pred_m = m.margin(b)[..., 0]
+        tgt_m, w_m = b["y2"][..., 0], b["y2"][..., 1]
+        aux = (w_m * (pred_m - tgt_m) ** 2).sum() / mx.maximum(w_m.sum(), 1.0)
+        # manual L2 (MLX Adam has no weight_decay): matrices only, tames memorizing embeddings
+        mats: list[mx.array] = [kv[1] for kv in tree_flatten(m.parameters())
+                               if isinstance(kv[1], mx.array) and kv[1].ndim > 1]
+        l2 = mx.stack([mx.sum(p * p) for p in mats]).sum() if mats else mx.array(0.0)
+        return ce_loss + 0.3 * aux + weight_decay * l2, logits
 
-    def step(batch: dict[str, mx.array]) -> tuple[mx.array, mx.array]:
-        (loss, logits), grads = nn.value_and_grad(model, loss_fn)(model, batch)
-        opt.update(model, grads)
-        return loss, logits
-
-    def eval_split(A: Arrays) -> tuple[float, npt.NDArray[np.float64], npt.NDArray[Any]]:
+    def eval_split(
+        A: Arrays, m: CricketMLP
+    ) -> tuple[float, npt.NDArray[np.float64], npt.NDArray[Any]]:
+        m.eval()  # dropout OFF — eval_split must be deterministic
         logit_list: list[npt.NDArray[np.float64]] = []
         y_list: list[npt.NDArray[Any]] = []
         vacc, vtot = 0.0, 0
         for b_np in batches(A, batch_size * 4, shuffle=False):
             b = to_mx(b_np)
-            logits = model(b)
+            logits = m(b)
             mx.eval(logits)
             logit_list.append(np.array(logits, dtype=np.float64))
             y_list.append(np.asarray(b_np["y"]))
@@ -289,67 +380,110 @@ def train(
             vtot += len(b_np["y"])
         return vacc / max(1, vtot), np.concatenate(logit_list), np.concatenate(y_list)
 
-    best_acc, best_epoch, bad = 0.0, -1, 0
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        tot, nb = 0.0, 0
-        for b_np in batches(Atr, batch_size, shuffle=True, seed=ep):
-            b = to_mx(b_np)
-            loss, _logits = step(b)
-            mx.eval(loss, model.parameters(), opt.state)
-            tot += float(np.asarray(loss).item())
-            nb += 1
-        vacc, _, _ = eval_split(Ava)
-        print(f"epoch {ep:02d} loss={tot/max(1,nb):.4f} val_acc={vacc:.4f} ({time.time()-t0:.1f}s)")
-        if vacc > best_acc + 1e-4:
-            best_acc, best_epoch, bad = vacc, ep, 0
-            model.save_weights(str(artifacts / "model.safetensors"))
-        else:
-            bad += 1
-            if bad >= patience:
-                print(f"early stop at epoch {ep} (patience {patience})")
-                break
+    val_logits_seeds: list[npt.NDArray[np.float64]] = []
+    test_logits_seeds: list[npt.NDArray[np.float64]] = []
+    seed_models: list[CricketMLP] = []
+    best_val_all, best_ep_all = 0.0, -1
+    for seed in range(n_seeds):
+        mx.random.seed(seed)
+        model = make_model()
+        opt = optim.Adam(learning_rate=lr)
 
-    model.load_weights(str(artifacts / "model.safetensors"))
-    # temperature scaling on val
-    _, val_logits, val_y = eval_split(Ava)
+        def step(batch: dict[str, mx.array], _m: CricketMLP = model, _o: optim.Adam = opt) -> tuple[mx.array, mx.array]:
+            (loss, logits), grads = nn.value_and_grad(_m, loss_fn)(_m, batch)
+            _o.update(_m, grads)
+            return loss, logits
+
+        best_acc, best_epoch, bad = 0.0, -1, 0
+        for ep in range(1, epochs + 1):
+            t0 = time.time()
+            tot, nb = 0.0, 0
+            for b_np in batches(Atr, batch_size, shuffle=True, seed=ep + 100 * seed):
+                b = to_mx(b_np)
+                loss, _logits = step(b)
+                mx.eval(loss, model.parameters(), opt.state)
+                tot += float(np.asarray(loss).item())
+                nb += 1
+            vacc, _, _ = eval_split(Ava, model)
+            print(f"seed {seed} epoch {ep:02d} loss={tot/max(1,nb):.4f} val_acc={vacc:.4f} ({time.time()-t0:.1f}s)")
+            if vacc > best_acc + 1e-4:
+                best_acc, best_epoch, bad = vacc, ep, 0
+                model.save_weights(str(artifacts / f"model_{seed}.safetensors"))
+            else:
+                bad += 1
+                if bad >= patience:
+                    print(f"seed {seed} early stop at epoch {ep}")
+                    break
+        model.load_weights(str(artifacts / f"model_{seed}.safetensors"))
+        if seed == 0:
+            model.save_weights(str(artifacts / "model.safetensors"))  # back-compat
+        seed_models.append(model)
+        _, vl, _ = eval_split(Ava, model)
+        _, tl, test_y = eval_split(Ate, model)
+        val_logits_seeds.append(vl)
+        test_logits_seeds.append(tl)
+        print(f"seed {seed} best val_acc={best_acc:.4f} at epoch {best_epoch}")
+        if best_acc > best_val_all:
+            best_val_all, best_ep_all = best_acc, best_epoch
+
+    val_logits = np.mean(val_logits_seeds, axis=0)
+    for _sm in seed_models:
+        _sm.eval()
+    # temperature scaling on seed-averaged val logits
+    _, _, val_y = eval_split(Ava, seed_models[0])
     temp = fit_temperature(val_logits, val_y)
     (artifacts / "temperature.json").write_text(json.dumps({"temperature": temp}, indent=2))
-    print(f"temperature={temp:.2f}")
+    print(f"temperature={temp:.2f} ({n_seeds} seeds)")
 
-    # final test eval with temperature
-    test_acc, test_logits, test_y = eval_split(Ate)
+    # final test eval with temperature (seed-averaged)
+    test_logits = np.mean(test_logits_seeds, axis=0)
     probs = softmax(test_logits, temp)
     pred = probs.argmax(axis=1)
     ll, brier = log_loss_and_brier(probs, test_y)
     per_slice = slice_metrics(te, probs, pred)
-    print(f"TEST acc={test_acc:.4f} (T={temp:.2f} scaled acc={float((pred==np.asarray(test_y)).mean()):.4f}) ll={ll:.4f} brier={brier:.4f}")
-    for k, v in sorted(per_slice.items()):
-        print(f"  {k}: {v}")
+    print(f"MLP {n_seeds}-seed test acc={float((pred==np.asarray(test_y)).mean()):.4f} (T={temp:.2f}) ll={ll:.4f} brier={brier:.4f}")
+    for kk, v in sorted(per_slice.items()):
+        print(f"  {kk}: {v}")
 
-    hist: dict[str, Any] = {"best_val_acc": best_acc, "best_epoch": best_epoch,
+    hist: dict[str, Any] = {"best_val_acc": best_val_all, "best_epoch": best_ep_all,
             "test_acc": float((pred == np.asarray(test_y)).mean()), "test_logloss": ll,
-            "test_brier": brier, "temperature": temp,
+            "test_brier": brier, "temperature": temp, "n_seeds": n_seeds,
             "n_train": len(tr), "n_val": len(va), "n_test": len(te),
             "per_slice": per_slice, "n_classes": n_classes,
             "label_smoothing": label_smoothing, "team_dim": team_dim}
     if run_baseline:
         try:
+            from sklearn.linear_model import LogisticRegression
             clf, hgb_acc, hgb_val_proba, hgb_test_proba = train_hgb(Atr, Ava, Ate)
             mlp_val_proba = softmax(val_logits, temp)
             w_mlp = tune_ensemble_weight(mlp_val_proba, hgb_val_proba, val_y)
+            # stacker: LogReg on [mlp_p1, hgb_p1, elo_prob] fit on val (beats fixed blend)
+            val_elo = np.asarray(Ava["elo_prob"])
+            test_elo = np.asarray(Ate["elo_prob"])
+            stack_Xva = np.column_stack([mlp_val_proba[:, 1], hgb_val_proba[:, 1], val_elo])
+            stack_Xte = np.column_stack([probs[:, 1], hgb_test_proba[:, 1], test_elo])
+            stacker = LogisticRegression(C=1.0, max_iter=1000).fit(stack_Xva, np.asarray(val_y).astype(int))
+            stack_te = stacker.predict_proba(stack_Xte)
+            stack_pred = stack_te.argmax(axis=1)
+            stack_acc = float((stack_pred == np.asarray(test_y)).mean())
+            stack_ll, stack_brier = log_loss_and_brier(stack_te, test_y)
             ens_test = w_mlp * probs + (1 - w_mlp) * hgb_test_proba
             ens_pred = ens_test.argmax(axis=1)
             ens_acc = float((ens_pred == np.asarray(test_y)).mean())
             ens_ll, ens_brier = log_loss_and_brier(ens_test, test_y)
             with open(artifacts / "hgb.pkl", "wb") as f:
                 pickle.dump(clf, f)
+            with open(artifacts / "stacker.pkl", "wb") as f:
+                pickle.dump({"model": stacker}, f)
             (artifacts / "ensemble.json").write_text(json.dumps(
                 {"w_mlp": w_mlp, "ensemble_acc": ens_acc,
-                 "ensemble_logloss": ens_ll, "ensemble_brier": ens_brier}, indent=2))
+                 "ensemble_logloss": ens_ll, "ensemble_brier": ens_brier,
+                 "stack_acc": stack_acc, "stack_logloss": stack_ll,
+                 "stack_brier": stack_brier}, indent=2))
             hist.update({"baseline_hgb_acc": hgb_acc, "ensemble_acc": ens_acc,
                          "ensemble_logloss": ens_ll, "ensemble_brier": ens_brier,
-                         "w_mlp": w_mlp})
+                         "w_mlp": w_mlp, "stack_acc": stack_acc,
+                         "stack_logloss": stack_ll, "stack_brier": stack_brier})
             print(f"baseline HGB={hgb_acc:.4f} ensemble(w_mlp={w_mlp:.2f})={ens_acc:.4f} ll={ens_ll:.4f}")
         except Exception as e:
             print("baseline skipped:", e)
@@ -363,43 +497,18 @@ def train(
                 pickle.dump(draw_bundle, f)
             te_test = dte[dte["format"] == "TEST"].reset_index(drop=True)
             va_test = dva[dva["format"] == "TEST"].reset_index(drop=True)
-
-            def winner_probs_for(frame: pd.DataFrame) -> npt.NDArray[np.float64]:
-                """Ensemble winner probs for decisive rows of frame (order-preserving)."""
-                dec = frame[frame["label"] != 2].reset_index()
-                out = np.zeros((len(frame), 2))
-                if not len(dec):
-                    return out
-                Ad = fs.transform(dec)
-                lg = model(to_mx(Ad))
-                mx.eval(lg)
-                mlp_p = softmax(np.array(lg, dtype=np.float64), temp)
-                try:
-                    with open(artifacts / "hgb.pkl", "rb") as fh:
-                        side = pickle.load(fh)
-                    hgb_p: npt.NDArray[np.float64] = side.predict_proba(to_hgb_matrix(Ad))
-                    w = float(hist.get("w_mlp", 0.5))
-                    mlp_p = w * mlp_p + (1 - w) * hgb_p
-                except Exception:
-                    pass
-                for kk, orig in enumerate(dec["index"].values):
-                    out[int(orig)] = mlp_p[kk]
-                return out
-
-            def three_way_acc(
-                frame: pd.DataFrame, draw_p: npt.NDArray[np.float64],
-                win_p: npt.NDArray[np.float64], thr: float,
-            ) -> float:
-                y = frame["label"].values.astype(int)
-                pred = np.where(draw_p >= thr, 2, win_p.argmax(axis=1))
-                return float((pred == y).mean())
-
-            Xva_test, _ = draw_features(va_test)
-            draw_p_val = draw_proba_bundle(draw_bundle, Xva_test)
-            win_p_val = winner_probs_for(va_test)
+            try:
+                with open(artifacts / "hgb.pkl", "rb") as fh:
+                    hgb_side = pickle.load(fh)
+                w_side = float(hist.get("w_mlp", 0.5))
+            except Exception:
+                hgb_side, w_side = None, 1.0
+            yva_test = va_test["label"].values.astype(int)
             best_t, best_3way = 0.5, -1.0
-            for t in np.arange(0.15, 0.75, 0.05):
-                a = three_way_acc(va_test, draw_p_val, win_p_val, float(t))
+            for t in np.arange(0.15, 0.8, 0.05):
+                pv = three_way_predictions(
+                    va_test, fs, seed_models, temp, draw_bundle, float(t), hgb_side, w_side)
+                a = float((pv == yva_test).mean())
                 if a > best_3way:
                     best_3way, best_t = a, float(t)
             draw_info["threshold_3way"] = round(best_t, 2)
@@ -408,10 +517,10 @@ def train(
                 json.dumps({"threshold": best_t}, indent=2))
             print(f"draw threshold 3-way-tuned: {best_t:.2f} (val 3-way acc={best_3way:.4f})")
 
-            Xte_test, _ = draw_features(te_test)
-            draw_p = draw_proba_bundle(draw_bundle, Xte_test)
-            win_p_test = winner_probs_for(te_test)
-            three_acc = three_way_acc(te_test, draw_p, win_p_test, best_t)
+            three_pred = three_way_predictions(
+                te_test, fs, seed_models, temp, draw_bundle, best_t, hgb_side, w_side)
+            y3 = te_test["label"].values.astype(int)
+            three_acc = float((three_pred == y3).mean())
             hist["test_3way_acc"] = round(three_acc, 4)
             hist["draw_model"] = draw_info
             print(f"TEST 3-way (win/loss/draw) test acc={three_acc:.4f} (n={len(te_test)})")
@@ -428,23 +537,35 @@ def evaluate_saved(artifacts: Path = ARTIFACTS_DIR, rebuild: bool = False) -> di
 
     artifacts = Path(artifacts)
     fs = _FS.load(artifacts / "features.json")
-    df = _ac(_lb(force=rebuild))
+    # chrono MUST run on the draws-included frame (draws shape histories),
+    # then filter to fair — exactly like train() does.
+    df = _ac(_lb(force=rebuild, keep_draws=True))
+    from ..config import ODI_CUTOFF_YEAR as _CUT
+    df = df[(df["label"] < 2) & (~df["method"].isin(["D/L", "VJD"]))].reset_index(drop=True)
+    df = df[~((df["format"] == "ODI") & (df["year"] < _CUT))].reset_index(drop=True)
     _, _, te = time_split(df)
     A = fs.transform(te)
     try:
         cfg = json.loads((artifacts / "model_config.json").read_text())
         team_dim, n_classes = int(cfg.get("team_dim", 16)), int(cfg.get("n_classes", 2))
+        n_seeds = int(cfg.get("n_seeds", 1))
     except Exception:
-        team_dim, n_classes = 16, 2
-    model = CricketMLP(
-        n_teams=len(fs.teams), n_country=len(fs.country), n_city=len(fs.city),
-        n_fmt=len(fs.format), n_toss_side=max(4, len(fs.toss_side)),
-        n_toss_choice=max(4, len(fs.toss_choice)),
-        n_gender=max(3, len(fs.gender)), n_team_type=max(3, len(fs.team_type)),
-        n_tier=max(8, len(fs.tier)),
-        team_dim=team_dim, n_classes=n_classes)
-    model.load_weights(str(artifacts / "model.safetensors"))
-    model.eval()
+        team_dim, n_classes, n_seeds = 16, 2, 1
+    models: list[CricketMLP] = []
+    for _s in range(n_seeds):
+        models.append(CricketMLP(
+            n_teams=len(fs.teams), n_country=len(fs.country), n_city=len(fs.city),
+            n_fmt=len(fs.format), n_toss_side=max(4, len(fs.toss_side)),
+            n_toss_choice=max(4, len(fs.toss_choice)),
+            n_gender=max(3, len(fs.gender)), n_team_type=max(3, len(fs.team_type)),
+            n_tier=max(8, len(fs.tier)),
+            team_dim=team_dim, n_classes=n_classes))
+    weight_files = [artifacts / f"model_{_s}.safetensors" for _s in range(n_seeds)]
+    if not all(p.exists() for p in weight_files):
+        weight_files = [artifacts / "model.safetensors"] * n_seeds
+    for m, wp in zip(models, weight_files):
+        m.load_weights(str(wp))
+        m.eval()
     try:
         temp = float(json.loads((artifacts / "temperature.json").read_text())["temperature"])
     except Exception:
@@ -452,27 +573,37 @@ def evaluate_saved(artifacts: Path = ARTIFACTS_DIR, rebuild: bool = False) -> di
     logit_list: list[npt.NDArray[np.float64]] = []
     for s in range(0, len(te), 1024):
         b = {kk: mx.array(v[s:s + 1024]) for kk, v in A.items()}
-        mo = model(b)
-        mx.eval(mo)
-        logit_list.append(np.array(mo, dtype=np.float64))
+        seed_out: list[npt.NDArray[np.float64]] = []
+        for m in models:
+            mo = m(b)
+            mx.eval(mo)
+            seed_out.append(np.array(mo, dtype=np.float64))
+        logit_list.append(np.mean(seed_out, axis=0))
     logits = np.concatenate(logit_list)
-    probs = softmax(logits, temp)
-    # ensemble with saved HGB if present
+    mlp_probs = softmax(logits, temp)
+    probs = mlp_probs
+    # stacker if present, else fixed blend with saved HGB
     try:
         with open(artifacts / "hgb.pkl", "rb") as f:
             clf = pickle.load(f)
-        ens_cfg = json.loads((artifacts / "ensemble.json").read_text())
-        w_mlp = float(ens_cfg.get("w_mlp", 0.5))
         hgb_proba: npt.NDArray[np.float64] = clf.predict_proba(to_hgb_matrix(A))
-        probs = w_mlp * probs + (1 - w_mlp) * hgb_proba
+        try:
+            with open(artifacts / "stacker.pkl", "rb") as f:
+                stacker = pickle.load(f)["model"]
+            elo_col = np.asarray(A["elo_prob"])
+            probs = stacker.predict_proba(np.column_stack([mlp_probs[:, 1], hgb_proba[:, 1], elo_col]))
+        except Exception:
+            ens_cfg = json.loads((artifacts / "ensemble.json").read_text())
+            w_mlp = float(ens_cfg.get("w_mlp", 0.5))
+            probs = w_mlp * mlp_probs + (1 - w_mlp) * hgb_proba
     except Exception:
         pass
     pred = probs.argmax(axis=1)
-    y = te["label"].values
+    y = np.asarray(te["label"].to_numpy(dtype=np.int64))
     ll, brier = log_loss_and_brier(probs, y)
     out: dict[str, Any] = {"acc": float((pred == np.asarray(y)).mean()), "logloss": ll, "brier": brier,
             "n": len(te), "per_slice": slice_metrics(te, probs, pred)}
-    # 3-way TEST (win/loss/draw) with saved draw model
+    # 3-way TEST (win/loss/draw) with saved draw model — same helper as train
     try:
         df3 = _ac(_lb(force=False, keep_draws=True))
         _, _, dte = time_split(df3)
@@ -480,28 +611,19 @@ def evaluate_saved(artifacts: Path = ARTIFACTS_DIR, rebuild: bool = False) -> di
         if len(te_test):
             with open(artifacts / "draw_lr.pkl", "rb") as f:
                 draw_bundle = pickle.load(f)
-            X3, _ = draw_features(te_test)
-            draw_p = draw_proba_bundle(draw_bundle, X3)
             try:
                 thr = float(json.loads((artifacts / "draw_threshold.json").read_text())["threshold"])
             except Exception:
                 thr = 0.5
-            # 3-way: draw where p>=thr else ensemble winner on decisive rows
-            three = np.full(len(te_test), 2, dtype=int)
-            dec3 = te_test[te_test["label"] != 2].reset_index()
-            if len(dec3):
-                Ad = fs.transform(dec3)
-                lg_list: list[npt.NDArray[np.float64]] = []
-                for s in range(0, len(dec3), 1024):
-                    bb = {kk: mx.array(v[s:s + 1024]) for kk, v in Ad.items()}
-                    oo = model(bb)
-                    mx.eval(oo)
-                    lg_list.append(np.array(oo, dtype=np.float64))
-                win_p = softmax(np.concatenate(lg_list), temp)
-                for kk, orig in enumerate(dec3["index"].values):
-                    if draw_p[int(orig)] < thr:
-                        three[int(orig)] = int(win_p[kk].argmax())
-            y3 = te_test["label"].values.astype(int)
+            try:
+                with open(artifacts / "hgb.pkl", "rb") as f:
+                    hgb_side = pickle.load(f)
+                w_side = float(json.loads((artifacts / "ensemble.json").read_text()).get("w_mlp", 0.5))
+            except Exception:
+                hgb_side, w_side = None, 1.0
+            three = three_way_predictions(
+                te_test, fs, models, temp, draw_bundle, thr, hgb_side, w_side)
+            y3 = np.asarray(te_test["label"].to_numpy(dtype=np.int64))
             out["test_3way_acc"] = round(float((three == y3).mean()), 4)
             out["test_3way_n"] = len(te_test)
     except Exception:
