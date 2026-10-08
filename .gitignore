@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.mypy_cache/
+
+# Virtual environments
+.venv
+
+# Data / artifacts (large, regenerated)
+data/
+artifacts/
+.env
+
+# Agent harness
+.agents/

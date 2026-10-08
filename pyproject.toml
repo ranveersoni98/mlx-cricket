@@ -1,0 +1,40 @@
+[project]
+name = "mlx-cric"
+version = "0.1.0"
+description = "Cricket match-result predictor built on Apple MLX (history + live CricAPI)"
+readme = "README.md"
+authors = [
+    { name = "Ranveer Soni", email = "git@ranveersoni.me" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    # IO: HF downloads (hub) + parquet engine (pandas needs one; MLX has no file IO).
+    # Compute stays MLX-native: everything becomes mx.array at the train/infer boundary.
+    "huggingface-hub>=0.34.0",
+    "pyarrow>=15",
+    "mlx>=0.32.3",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "python-dotenv>=1.0",
+    "scikit-learn>=1.5",
+    "requests>=2.31",
+]
+
+[project.scripts]
+mlx-cric = "mlx_cric:main"
+
+[project.optional-dependencies]
+dev = ["mypy>=1.0"]
+
+[tool.mypy]
+python_version = "3.14"
+check_untyped_defs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
