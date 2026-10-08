@@ -187,6 +187,14 @@ class Predictor:
         except Exception:
             self.ratings_map = {}
         try:
+            _pl = _json.loads((self.artifacts / "pool.json").read_text())
+            self.pool_map: dict[tuple[str, str], tuple[float, float]] = {}
+            for _k, _v in _pl.items():
+                _t, _, _g = _k.partition("||")
+                self.pool_map[(str(_t), str(_g))] = (float(_v["bat"]), float(_v["bowl"]))
+        except Exception:
+            self.pool_map = {}
+        try:
             self.hist = _history_snapshot()
             self.elo_map = _elo_lookup(self.hist)
         except Exception:
@@ -247,8 +255,8 @@ class Predictor:
             drw_v = 0.3
             rstd = 0.0
         fg = {"ODI": "ODI", "T20": "T20", "TEST": "MULTI"}.get(fmt, fmt)
-        b1, w1 = self.ratings_map.get((team1, fg), (0.0, 0.0))
-        b2, w2 = self.ratings_map.get((team2, fg), (0.0, 0.0))
+        pb1, pw1 = self.pool_map.get((team1, fg), (0.0, 0.0))
+        pb2, pw2 = self.pool_map.get((team2, fg), (0.0, 0.0))
         df = pd.DataFrame([{
             "team1": team1, "team2": team2,
             "venue_stadium": venue_stadium, "venue_city": venue_city,
@@ -259,6 +267,7 @@ class Predictor:
             "form_diff": f1 - f2, "h2h": h, "venue_edge": vedge,
             "toss_venue": tven, "star_diff": 0.0, "exp_diff": 0.0, "draw_venue": drw_v,
             "rest_diff": rstd, "month_sin": msin, "month_cos": mcos,
+            "pool_bat_diff": pb1 - pb2, "pool_bowl_diff": pw1 - pw2,
         }])
         return df
 

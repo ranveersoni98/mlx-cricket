@@ -13,7 +13,8 @@ UNK = "__UNK__"
 
 NUMERIC_COLS = ["elo_diff", "abs_elo_diff", "elo_win_prob", "year", "toss1",
                 "form_diff", "h2h", "venue_edge", "toss_venue",
-                "star_diff", "exp_diff", "draw_venue", "rest_diff"]
+                "star_diff", "exp_diff", "draw_venue", "rest_diff",
+                "pool_bat_diff", "pool_bowl_diff"]
 
 
 class Vocab:
@@ -137,6 +138,8 @@ class FeatureStore:
         rest_d = std_col("rest_diff", 0.0)
         msin = raw_f32("month_sin", 0.0)
         mcos = raw_f32("month_cos", 1.0)
+        pool_b = std_col("pool_bat_diff", 0.0)
+        pool_w = std_col("pool_bowl_diff", 0.0)
         y = np.asarray(df["label"].to_numpy(dtype=np.int32), dtype=np.int32) if "label" in df else np.zeros(n, np.int32)
         return {
             "t1": t1, "t2": t2, "country": co, "city": ci, "fmt": fm,
@@ -144,7 +147,8 @@ class FeatureStore:
             "elo": elo, "abs_elo": abs_elo, "elo_prob": eprob, "year": year, "toss1": toss1,
             "form_diff": form_diff, "h2h": h2h_v, "venue_edge": vedge,
             "toss_venue": tven, "star_diff": star, "exp_diff": expd, "draw_venue": drw_v,
-            "rest_diff": rest_d, "month_sin": msin, "month_cos": mcos, "y": y,
+            "rest_diff": rest_d, "month_sin": msin, "month_cos": mcos,
+            "pool_bat_diff": pool_b, "pool_bowl_diff": pool_w, "y": y,
         }
 
     def to_json(self) -> dict[str, Any]:

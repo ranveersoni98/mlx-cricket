@@ -27,7 +27,7 @@ Arrays = dict[str, npt.NDArray[Any]]
 HGB_KEYS: list[str] = [
     "elo", "abs_elo", "elo_prob", "year", "toss1", "form_diff", "h2h",
     "venue_edge", "toss_venue", "star_diff", "exp_diff", "draw_venue",
-    "rest_diff", "month_sin", "month_cos",
+    "rest_diff", "month_sin", "month_cos", "pool_bat_diff", "pool_bowl_diff",
     "t1", "t2", "country", "city", "fmt", "toss_side",
     "toss_choice", "gender", "team_type", "tier",
 ]
@@ -297,6 +297,13 @@ def train(
     latest = latest_ratings(ratings)
     (artifacts / "ratings.json").write_text(json.dumps(
         {f"{t}||{g}": {"bat": b, "bowl": w} for (t, g), (b, w) in latest.items()}, indent=2))
+    from ..data.pool import add_pool_features, build_pool_cache, latest_pool
+    print("merging player-pool ratings...")
+    pool_cache = pd.read_parquet(build_pool_cache())
+    df = add_pool_features(df, pool_cache)
+    latest_p = latest_pool(pool_cache)
+    (artifacts / "pool.json").write_text(json.dumps(
+        {f"{t}||{g}": {"bat": b, "bowl": w} for (t, g), (b, w) in latest_p.items()}, indent=2))
     save_processed(df, PROCESSED_DIR / "matches_unified_draws.csv")
     df = add_chrono_features(df)
 
