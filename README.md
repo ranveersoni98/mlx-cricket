@@ -1,4 +1,4 @@
-# mlx-cric
+# MLX-Cric
 
 Predict cricket winners with Apple MLX. Trained on ~27k historical matches, works on live fixtures through CricAPI.
 
