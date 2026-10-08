@@ -25,24 +25,28 @@ def _history_snapshot() -> pd.DataFrame:
 
 
 def _elo_lookup(df_hist: pd.DataFrame) -> dict[str, float]:
-    """Latest Elo per team (unseen -> 1500)."""
-    last: dict[str, float] = {}
-    for _, r in df_hist.sort_values("year").iterrows():
-        last[r["team1"]] = float(r.get("elo1", 1500.0))
-        last[r["team2"]] = float(r.get("elo2", 1500.0))
-    # elo1 col stores pre-match rating + home bump; strip bump approx by keeping raw map
-    # from a clean replay for exactness:
+    """Latest Elo per team — replays chrono rules (format-K, auction resets)."""
+    from ..features.chrono import AUCTION_YEARS, FORMAT_K, IPL_TEAMS
     ratings: dict[str, float] = {}
     base = 1500.0
-    for _, r in df_hist.sort_values(["year"]).iterrows():
-        for t in (r["team1"], r["team2"]):
+    last_year: dict[str, int] = {}
+    dh = df_hist.copy()
+    dh["_d"] = pd.to_datetime(dh.get("date"), errors="coerce")
+    for _, r in dh.sort_values("_d").iterrows():
+        t1, t2 = str(r["team1"]), str(r["team2"])
+        yr = int(r["year"]) if pd.notna(r["year"]) else 2000
+        for t in (t1, t2):
             ratings.setdefault(t, base)
+            if t in IPL_TEAMS and last_year.get(t, yr) != yr and yr in AUCTION_YEARS:
+                ratings[t] = base + 0.5 * (ratings[t] - base)
+            last_year[t] = yr
         if r["label"] in (0, 1):
             s1 = 1.0 if r["label"] == 0 else 0.0
-            r1, r2 = ratings[r["team1"]], ratings[r["team2"]]
+            r1, r2 = ratings[t1], ratings[t2]
+            kk = FORMAT_K.get(str(r.get("format", "ODI")), 20.0)
             exp1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
-            ratings[r["team1"]] = r1 + 20.0 * (s1 - exp1)
-            ratings[r["team2"]] = r2 + 20.0 * ((1 - s1) - (1 - exp1))
+            ratings[t1] = r1 + kk * (s1 - exp1)
+            ratings[t2] = r2 + kk * ((1 - s1) - (1 - exp1))
     return ratings
 
 
@@ -239,6 +243,9 @@ class Predictor:
         e2 = self.elo_map.get(team2, 1500.0)
         diff = (e1 - e2) / 400.0
         prob = 1.0 / (1.0 + 10 ** (-diff))
+        gap = abs(e1 - e2) / 400.0
+        close = max(0.0, 1.0 - min(1.0, gap * 2.0))
+        tlev_v = (1.0 if toss_side == "team1" else (-1.0 if toss_side == "team2" else 0.0)) * close
         # live rolling form from history (causal: history ends before today)
         if len(self.hist):
             f1, f2 = _live_form(team1, self.hist), _live_form(team2, self.hist)
@@ -268,6 +275,7 @@ class Predictor:
             "toss_venue": tven, "star_diff": 0.0, "exp_diff": 0.0, "draw_venue": drw_v,
             "rest_diff": rstd, "month_sin": msin, "month_cos": mcos,
             "pool_bat_diff": pb1 - pb2, "pool_bowl_diff": pw1 - pw2,
+            "toss_leverage": tlev_v,
         }])
         return df
 
@@ -318,7 +326,9 @@ class Predictor:
                 import numpy as _np2
                 elo1 = float(_np2.asarray(arr["elo_prob"])[0])
                 X = _np2.array([[float(mlp_p[0][1]), float(hgb_p[0][1]), elo1]])
-                probs = _np2.asarray(self.stacker["model"].predict_proba(X), dtype=float)
+                stack_p = _np2.asarray(self.stacker["model"].predict_proba(X), dtype=float)
+                blend_p = self.w_mlp * mlp_p + (1 - self.w_mlp) * hgb_p
+                probs = 0.5 * stack_p + 0.5 * blend_p
             else:
                 probs = self.w_mlp * mlp_p + (1 - self.w_mlp) * hgb_p
         p = probs[0]

@@ -34,7 +34,7 @@ class CricketMLP(nn.Module):
         self.ttype_emb = nn.Embedding(max(2, n_team_type), 4)
         self.tier_emb = nn.Embedding(max(2, n_tier), 4)
 
-        n_num = 17  # + pool_bat/bowl_diff (squad strength)
+        n_num = 18  # + toss_leverage (toss matters most when even)
         in_dim = team_dim * 2 + cat_dim * 3 + 4 * 2 + 4 + 4 + 4 + n_num
         layers: list[nn.Module] = []
         prev = in_dim
@@ -75,6 +75,7 @@ class CricketMLP(nn.Module):
                 col("draw_venue", 0.3), col("rest_diff", 0.0),
                 col("month_sin", 0.0), col("month_cos", 1.0),
                 col("pool_bat_diff", 0.0), col("pool_bowl_diff", 0.0),
+                col("toss_leverage", 0.0),
             ],
             axis=-1,
         )

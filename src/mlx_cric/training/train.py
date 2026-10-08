@@ -27,7 +27,7 @@ Arrays = dict[str, npt.NDArray[Any]]
 HGB_KEYS: list[str] = [
     "elo", "abs_elo", "elo_prob", "year", "toss1", "form_diff", "h2h",
     "venue_edge", "toss_venue", "star_diff", "exp_diff", "draw_venue",
-    "rest_diff", "month_sin", "month_cos", "pool_bat_diff", "pool_bowl_diff",
+    "rest_diff", "month_sin", "month_cos", "pool_bat_diff", "pool_bowl_diff", "toss_leverage",
     "t1", "t2", "country", "city", "fmt", "toss_side",
     "toss_choice", "gender", "team_type", "tier",
 ]
@@ -589,7 +589,7 @@ def evaluate_saved(artifacts: Path = ARTIFACTS_DIR, rebuild: bool = False) -> di
     logits = np.concatenate(logit_list)
     mlp_probs = softmax(logits, temp)
     probs = mlp_probs
-    # stacker if present, else fixed blend with saved HGB
+    # product = average of fixed blend + stacker (kills selection noise between them)
     try:
         with open(artifacts / "hgb.pkl", "rb") as f:
             clf = pickle.load(f)
@@ -598,7 +598,10 @@ def evaluate_saved(artifacts: Path = ARTIFACTS_DIR, rebuild: bool = False) -> di
             with open(artifacts / "stacker.pkl", "rb") as f:
                 stacker = pickle.load(f)["model"]
             elo_col = np.asarray(A["elo_prob"])
-            probs = stacker.predict_proba(np.column_stack([mlp_probs[:, 1], hgb_proba[:, 1], elo_col]))
+            stack_p = stacker.predict_proba(np.column_stack([mlp_probs[:, 1], hgb_proba[:, 1], elo_col]))
+            ens_cfg = json.loads((artifacts / "ensemble.json").read_text())
+            w_mlp = float(ens_cfg.get("w_mlp", 0.5))
+            probs = 0.5 * stack_p + 0.5 * (w_mlp * mlp_probs + (1 - w_mlp) * hgb_proba)
         except Exception:
             ens_cfg = json.loads((artifacts / "ensemble.json").read_text())
             w_mlp = float(ens_cfg.get("w_mlp", 0.5))

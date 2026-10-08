@@ -11,6 +11,15 @@ import pandas as pd
 
 from ..config import FORM_WINDOW, H2H_WINDOW
 
+# Shared with live inference (predict replays the same rating trajectory).
+FORMAT_K = {"T20": 30.0, "ODI": 20.0, "TEST": 15.0}
+IPL_TEAMS = {"Mumbai Indians", "Chennai Super Kings", "Royal Challengers Bangalore",
+             "Kolkata Knight Riders", "Delhi Daredevils", "Rajasthan Royals",
+             "Sunrisers Hyderabad", "Kings XI Punjab", "Deccan Chargers",
+             "Pune Warriors", "Kochi Tuskers Kerala", "Gujarat Lions",
+             "Rising Pune Supergiant"}
+AUCTION_YEARS = {2011, 2014, 2018, 2022, 2025}
+
 
 def add_chrono_features(
     df: pd.DataFrame, k: float = 20.0, base: float = 1500.0, home_adv: float = 15.0
@@ -56,6 +65,7 @@ def add_chrono_features(
         "Kochi Tuskers Kerala": "Kochi", "Gujarat Lions": "Rajkot",
         "Rising Pune Supergiant": "Pune",
     }
+    last_year: dict[str, int] = {}
 
     ratings: dict[str, float] = defaultdict(lambda: base)
     recent: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=FORM_WINDOW))
@@ -71,13 +81,20 @@ def add_chrono_features(
     e1 = np.zeros(n); e2 = np.zeros(n)
     form = np.zeros(n); hh = np.full(n, 0.5); vedge = np.zeros(n)
     tven = np.full(n, 0.5); star = np.zeros(n); expd = np.zeros(n)
-    drw = np.full(n, 0.3); rest = np.zeros(n)
+    drw = np.full(n, 0.3); rest = np.zeros(n); tlev = np.zeros(n)
 
     has_pom = "player_of_match" in df.columns
     for pos, idx in enumerate(order):
         r = df.iloc[int(idx)]
         t1, t2 = str(r["team1"]), str(r["team2"])
         city = str(r.get("venue_city", "Unknown"))
+        fmt = str(r.get("format", "ODI"))
+        yr = int(r.get("year", 2000))
+        # auction reset: squad reshuffled over the break — stale Elo lies
+        for t in (t1, t2):
+            if t in IPL_TEAMS and last_year.get(t, yr) != yr and yr in AUCTION_YEARS:
+                ratings[t] = base + 0.5 * (ratings[t] - base)
+            last_year[t] = yr
         r1, r2 = ratings[t1], ratings[t2]
         home1 = country_home.get(t1) == r["venue_country"] or city_home.get(t1) == city
         home2 = country_home.get(t2) == r["venue_country"] or city_home.get(t2) == city
@@ -90,6 +107,12 @@ def add_chrono_features(
         rs2 = (today - last_seen[t2]).days if t2 in last_seen else 30
         rest[int(idx)] = float(max(-30, min(30, rs1 - rs2))) / 30.0
 
+        # toss leverage: winning the toss matters most when teams are even.
+        # closeness in [0,1] from pre-match Elo gap (uses r1/r2, no outcome).
+        gap = abs(r1 - r2) / 400.0
+        close = max(0.0, 1.0 - min(1.0, gap * 2.0))
+        tlev[int(idx)] = (1.0 if str(r.get("toss_side")) == "team1"
+                          else (-1.0 if str(r.get("toss_side")) == "team2" else 0.0)) * close
         # form: mean of last-5 results (1 = won), prior 0.5 when empty
         f1 = float(np.mean(list(recent[t1]))) if recent[t1] else 0.5
         f2 = float(np.mean(list(recent[t2]))) if recent[t2] else 0.5
@@ -119,10 +142,11 @@ def add_chrono_features(
         # --- update with outcome (label 0/1; label 2 draws handled by caller) ---
         lab = r["label"]
         if lab in (0, 1):
+            kk = FORMAT_K.get(fmt, k)
             s_1 = 1.0 if lab == 0 else 0.0
             exp1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
-            ratings[t1] = r1 + k * (s_1 - exp1)
-            ratings[t2] = r2 + k * ((1 - s_1) - (1 - exp1))
+            ratings[t1] = r1 + kk * (s_1 - exp1)
+            ratings[t2] = r2 + kk * ((1 - s_1) - (1 - exp1))
             recent[t1].append(1.0 if lab == 0 else 0.0)
             recent[t2].append(1.0 if lab == 1 else 0.0)
             winner = t1 if lab == 0 else t2
@@ -169,6 +193,7 @@ def add_chrono_features(
     df["exp_diff"] = expd
     df["draw_venue"] = drw
     df["rest_diff"] = rest
+    df["toss_leverage"] = tlev
     m = pd.to_datetime(df["_ord_date"]).dt.month.fillna(6).astype(float)
     df["month_sin"] = np.sin(2 * np.pi * m / 12.0)
     df["month_cos"] = np.cos(2 * np.pi * m / 12.0)
