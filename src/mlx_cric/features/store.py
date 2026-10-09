@@ -124,7 +124,13 @@ class FeatureStore:
         elo = std_col("elo_diff", 0.0)
         abs_elo = std_col("abs_elo_diff", 0.0)
         eprob = raw_f32("elo_win_prob", 0.5)
-        year = ((raw_f32("year", float(self.year_min)) - self.year_min) / max(1, self.year_max - self.year_min)).astype(np.float32)
+        # Year was fit on train only (<= TRAIN_END_YEAR): clip so val/test/live
+        # seasons map into [0, 1] instead of drifting out-of-distribution.
+        span = max(1, self.year_max - self.year_min)
+        yr_raw = raw_f32("year", float(self.year_min))
+        import numpy as _np
+
+        year = _np.clip((yr_raw - self.year_min) / span, 0.0, 1.0).astype(np.float32)
         # toss from team1's view: +1 won it, -1 lost it, 0 unknown
         toss_side = np.asarray(df["toss_side"].to_numpy(dtype=str))
         toss1 = np.where(toss_side == "team1", 1.0, np.where(toss_side == "team2", -1.0, 0.0)).astype(np.float32)

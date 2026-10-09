@@ -38,13 +38,13 @@ Features are all chronological: Elo (with proper IPL home cities), last-5 form, 
 | Slice | Acc |
 |---|---|
 | Overall (MLP ×5 + HGB, stacked + blended) | 64.4% |
-| International | 71.4% |
-| Women's | 66.9% |
-| T20 | 65.7% |
-| ODI | 60.5% |
-| Test (decisive) | 60.2% |
-| Test (win/loss/draw) | 43.9% |
-| Domestic/club | 57.2% |
+| International | 70.8% |
+| Women's | 66.0% |
+| T20 | 64.7% |
+| ODI | 61.5% |
+| Test (decisive) | 61.0% |
+| Test (win/loss/draw) | 43.1% |
+| Domestic/club | 56.6% |
 
 Club cricket and draws are the weak spots thin data and rain, respectively. The honest numbers are in `artifacts/metrics.json` after training.
 

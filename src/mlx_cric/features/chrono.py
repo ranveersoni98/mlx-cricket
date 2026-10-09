@@ -13,12 +13,46 @@ from ..config import FORM_WINDOW, H2H_WINDOW
 
 # Shared with live inference (predict replays the same rating trajectory).
 FORMAT_K = {"T20": 30.0, "ODI": 20.0, "TEST": 15.0}
+HOME_ADV = 15.0
 IPL_TEAMS = {"Mumbai Indians", "Chennai Super Kings", "Royal Challengers Bangalore",
              "Kolkata Knight Riders", "Delhi Daredevils", "Rajasthan Royals",
              "Sunrisers Hyderabad", "Kings XI Punjab", "Deccan Chargers",
              "Pune Warriors", "Kochi Tuskers Kerala", "Gujarat Lions",
-             "Rising Pune Supergiant"}
+             "Rising Pune Supergiant", "Gujarat Titans", "Lucknow Super Giants"}
 AUCTION_YEARS = {2011, 2014, 2018, 2022, 2025}
+
+HOME_COUNTRY_TEAMS: dict[str, list[str]] = {
+    "India": ["India", "Mumbai Indians", "Chennai Super Kings", "Royal Challengers Bangalore",
+              "Kolkata Knight Riders", "Delhi Daredevils", "Rajasthan Royals",
+              "Sunrisers Hyderabad", "Kings XI Punjab", "Deccan Chargers",
+              "Pune Warriors", "Kochi Tuskers Kerala", "Gujarat Lions",
+              "Rising Pune Supergiant", "Gujarat Titans", "Lucknow Super Giants"],
+    "Australia": ["Australia"], "England": ["England"], "Pakistan": ["Pakistan"],
+    "South Africa": ["South Africa"], "New Zealand": ["New Zealand"],
+    "Sri Lanka": ["Sri Lanka"], "West Indies": ["West Indies"],
+    "Bangladesh": ["Bangladesh"], "Zimbabwe": ["Zimbabwe"],
+    "Afghanistan": ["Afghanistan"], "Ireland": ["Ireland"],
+}
+# club home cities (IPL etc.) — country check misses these entirely
+CITY_HOME_TEAMS: dict[str, str] = {
+    "Mumbai Indians": "Mumbai", "Chennai Super Kings": "Chennai",
+    "Royal Challengers Bangalore": "Bengaluru", "Kolkata Knight Riders": "Kolkata",
+    "Delhi Daredevils": "Delhi", "Rajasthan Royals": "Jaipur",
+    "Sunrisers Hyderabad": "Hyderabad", "Kings XI Punjab": "Mohali",
+    "Deccan Chargers": "Hyderabad", "Pune Warriors": "Pune",
+    "Kochi Tuskers Kerala": "Kochi", "Gujarat Lions": "Rajkot",
+    "Rising Pune Supergiant": "Pune",
+    "Gujarat Titans": "Ahmedabad", "Lucknow Super Giants": "Lucknow",
+}
+
+_COUNTRY_HOME: dict[str, str] = {
+    t: c for c, teams in HOME_COUNTRY_TEAMS.items() for t in teams
+}
+
+
+def is_home(team: str, venue_country: object, venue_city: str) -> bool:
+    """Same home check used in training (chrono) and live inference."""
+    return _COUNTRY_HOME.get(team) == venue_country or CITY_HOME_TEAMS.get(team) == venue_city
 
 
 def add_chrono_features(
@@ -39,32 +73,10 @@ def add_chrono_features(
     df["_ord_date"] = dates.fillna(fallback)
     order = np.argsort(np.asarray(df["_ord_date"].to_numpy(dtype="datetime64[ns]")), kind="stable")
 
-    home_team = {
-        "India": ["India", "Mumbai Indians", "Chennai Super Kings", "Royal Challengers Bangalore",
-                  "Kolkata Knight Riders", "Delhi Daredevils", "Rajasthan Royals",
-                  "Sunrisers Hyderabad", "Kings XI Punjab", "Deccan Chargers",
-                  "Pune Warriors", "Kochi Tuskers Kerala", "Gujarat Lions",
-                  "Rising Pune Supergiant"],
-        "Australia": ["Australia"], "England": ["England"], "Pakistan": ["Pakistan"],
-        "South Africa": ["South Africa"], "New Zealand": ["New Zealand"],
-        "Sri Lanka": ["Sri Lanka"], "West Indies": ["West Indies"],
-        "Bangladesh": ["Bangladesh"], "Zimbabwe": ["Zimbabwe"],
-        "Afghanistan": ["Afghanistan"], "Ireland": ["Ireland"],
-    }
-    country_home: dict[str, str] = {}
-    for c, teams in home_team.items():
-        for t in teams:
-            country_home[t] = c
+    home_team = HOME_COUNTRY_TEAMS
+    country_home: dict[str, str] = _COUNTRY_HOME
     # club home cities (IPL etc.) — country check misses these entirely
-    city_home: dict[str, str] = {
-        "Mumbai Indians": "Mumbai", "Chennai Super Kings": "Chennai",
-        "Royal Challengers Bangalore": "Bengaluru", "Kolkata Knight Riders": "Kolkata",
-        "Delhi Daredevils": "Delhi", "Rajasthan Royals": "Jaipur",
-        "Sunrisers Hyderabad": "Hyderabad", "Kings XI Punjab": "Mohali",
-        "Deccan Chargers": "Hyderabad", "Pune Warriors": "Pune",
-        "Kochi Tuskers Kerala": "Kochi", "Gujarat Lions": "Rajkot",
-        "Rising Pune Supergiant": "Pune",
-    }
+    city_home: dict[str, str] = CITY_HOME_TEAMS
     last_year: dict[str, int] = {}
 
     ratings: dict[str, float] = defaultdict(lambda: base)
@@ -96,8 +108,8 @@ def add_chrono_features(
                 ratings[t] = base + 0.5 * (ratings[t] - base)
             last_year[t] = yr
         r1, r2 = ratings[t1], ratings[t2]
-        home1 = country_home.get(t1) == r["venue_country"] or city_home.get(t1) == city
-        home2 = country_home.get(t2) == r["venue_country"] or city_home.get(t2) == city
+        home1 = is_home(t1, r["venue_country"], city)
+        home2 = is_home(t2, r["venue_country"], city)
         b1 = home_adv if home1 else 0.0
         b2 = home_adv if home2 else 0.0
         e1[int(idx)], e2[int(idx)] = r1 + b1, r2 + b2

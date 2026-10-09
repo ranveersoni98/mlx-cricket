@@ -10,9 +10,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Data / artifacts (large, regenerated)
-data/
-artifacts/
+# Data / artifacts (large, regenerated; root-anchored so the
+# src/mlx_cric/data source package stays tracked)
+/data/
+/artifacts/
 .env
 
 # Agent harness

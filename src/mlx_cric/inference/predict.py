@@ -66,6 +66,29 @@ def _live_h2h(t1: str, t2: str, df_hist: pd.DataFrame, n: int = 5) -> float:
     return wins / len(d)
 
 
+def _live_star(team: str, df_hist: pd.DataFrame, n: int = 20) -> float:
+    """POM-share over the team's last n games — mirrors chrono's star proxy.
+
+    Training attributes player_of_match to the winner's side (1.0 when the
+    side won and a POM was recorded, else 0.0); replay that here instead of
+    feeding a constant 0.0.
+    """
+    d = df_hist[(df_hist["team1"] == team) | (df_hist["team2"] == team)].tail(n)
+    if len(d) == 0:
+        return 0.0
+    has_pom = "player_of_match" in df_hist.columns
+    vals = []
+    for _, r in d.iterrows():
+        won = (r["team1"] == team and r["label"] == 0) or (r["team2"] == team and r["label"] == 1)
+        pom = str(r.get("player_of_match", "") or "") if has_pom else ""
+        vals.append(1.0 if (pom and won) else 0.0)
+    return float(sum(vals) / len(vals))
+
+
+def _live_games(team: str, df_hist: pd.DataFrame) -> int:
+    return int(((df_hist["team1"] == team) | (df_hist["team2"] == team)).sum())
+
+
 def _city_rate(team: str, city: str, df_hist: pd.DataFrame) -> float:
     d = df_hist[
         (df_hist["venue_city"] == city)
@@ -239,8 +262,12 @@ class Predictor:
         fmt = {"T20I": "T20", "IPL-T20": "T20", "ODI": "ODI", "T20": "T20", "TEST": "TEST"}.get(fmt, fmt)
         # tier: domestic multi-day draws far more often than Tests (38% vs 19%)
         tier = "MDM" if (fmt == "TEST" and team_type == "club") else {"TEST": "Test", "ODI": "ODI", "T20": "T20"}.get(fmt, fmt)
-        e1 = self.elo_map.get(team1, 1500.0)
-        e2 = self.elo_map.get(team2, 1500.0)
+        # Home-adjusted Elo — training adds HOME_ADV to the host's rating
+        # before differencing, so replay it here (was: raw ratings, skewed
+        # toward away sides in home fixtures).
+        from ..features.chrono import HOME_ADV, is_home
+        e1 = self.elo_map.get(team1, 1500.0) + (HOME_ADV if is_home(team1, venue_country, venue_city) else 0.0)
+        e2 = self.elo_map.get(team2, 1500.0) + (HOME_ADV if is_home(team2, venue_country, venue_city) else 0.0)
         diff = (e1 - e2) / 400.0
         prob = 1.0 / (1.0 + 10 ** (-diff))
         gap = abs(e1 - e2) / 400.0
@@ -254,6 +281,8 @@ class Predictor:
             tven = _city_toss_rate(venue_city, self.hist)
             drw_v = _city_draw_rate(venue_city, self.hist)
             rstd = max(-30.0, min(30.0, _days_rest(team1, at, self.hist) - _days_rest(team2, at, self.hist))) / 30.0
+            star_v = _live_star(team1, self.hist) - _live_star(team2, self.hist)
+            exp_v = _math.log1p(_live_games(team1, self.hist)) - _math.log1p(_live_games(team2, self.hist))
         else:
             f1 = f2 = 0.5
             h = 0.5
@@ -261,6 +290,8 @@ class Predictor:
             tven = 0.5
             drw_v = 0.3
             rstd = 0.0
+            star_v = 0.0
+            exp_v = 0.0
         fg = {"ODI": "ODI", "T20": "T20", "TEST": "MULTI"}.get(fmt, fmt)
         pb1, pw1 = self.pool_map.get((team1, fg), (0.0, 0.0))
         pb2, pw2 = self.pool_map.get((team2, fg), (0.0, 0.0))
@@ -272,7 +303,7 @@ class Predictor:
             "elo_diff": diff, "elo_win_prob": prob, "label": 0,
             "gender": gender, "team_type": team_type, "tier": tier,
             "form_diff": f1 - f2, "h2h": h, "venue_edge": vedge,
-            "toss_venue": tven, "star_diff": 0.0, "exp_diff": 0.0, "draw_venue": drw_v,
+            "toss_venue": tven, "star_diff": star_v, "exp_diff": exp_v, "draw_venue": drw_v,
             "rest_diff": rstd, "month_sin": msin, "month_cos": mcos,
             "pool_bat_diff": pb1 - pb2, "pool_bowl_diff": pw1 - pw2,
             "toss_leverage": tlev_v,
@@ -390,21 +421,20 @@ COUNTRY_TEAMS = {
     "ireland", "netherlands", "scotland", "namibia", "nepal", "oman",
     "papua new guinea", "usa", "canada", "kenya", "hong kong", "singapore",
     "malaysia", "germany", "gibraltar", "israel", "isle of man",
+    "uganda", "jersey", "guernsey", "thailand", "bhutan", "maldives",
+    "united arab emirates", "uae",
 }
 
 def infer_team_type(t1: str, t2: str) -> str:
-    """International if both look like countries (or women country sides), else club."""
+    """International if both sides look like countries, else club.
+
+    Handles "X Women" country sides; franchise/domestic sides (e.g. Gujarat
+    vs Odisha, IPL clubs) fall through to club.
+    """
     def is_country(t: str) -> bool:
-        tl = t.lower().replace(" women", "").strip()
-        return tl in COUNTRY_TEAMS or len(tl.split()) <= 2 and tl not in {
-            "mumbai indians", "chennai super kings", "royal challengers bangalore",
-            "kolkata knight riders", "delhi daredevils", "rajasthan royals",
-            "sunrisers hyderabad", "kings xi punjab",
-        } and " " not in tl or tl in COUNTRY_TEAMS
-    # simple: known countries -> international, else club (franchise/domestic e.g. Gujarat vs Odisha)
-    c1 = t1.lower().replace(" women", "").strip() in COUNTRY_TEAMS
-    c2 = t2.lower().replace(" women", "").strip() in COUNTRY_TEAMS
-    return "international" if (c1 and c2) else "club"
+        return t.lower().replace(" women", "").strip() in COUNTRY_TEAMS
+
+    return "international" if (is_country(t1) and is_country(t2)) else "club"
 
 
 def _guess_format(match_type: str) -> str:
