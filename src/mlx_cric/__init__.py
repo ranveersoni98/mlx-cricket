@@ -37,6 +37,14 @@ def main() -> None:
     ev = sub.add_parser("evaluate", help="Walk-forward test metrics + per-slice (no training)")
     ev.add_argument("--rebuild", action="store_true")
 
+    dl = sub.add_parser("download-model", help="Download pretrained weights from HF Hub (no training needed)")
+    dl.add_argument("--repo", default=None, help="HF model repo (default: RanveerSoni98/mlx-cric)")
+    dl.add_argument("--revision", default="main")
+
+    ul = sub.add_parser("upload-model", help="Upload local artifacts/ to HF Hub")
+    ul.add_argument("--repo", default=None, help="HF model repo (default: RanveerSoni98/mlx-cric)")
+    ul.add_argument("--private", action="store_true")
+
     sub.add_parser("check-data", help="Download HF + sample CricAPI status")
 
     a = p.parse_args()
@@ -63,6 +71,13 @@ def main() -> None:
     elif a.cmd == "evaluate":
         from .training import evaluate_saved
         print(json.dumps(evaluate_saved(rebuild=a.rebuild), indent=2))
+    elif a.cmd == "download-model":
+        from .hub import download_artifacts
+        dest = download_artifacts(repo_id=a.repo, revision=a.revision)
+        print(f"downloaded weights -> {dest}")
+    elif a.cmd == "upload-model":
+        from .hub import upload_artifacts
+        print(upload_artifacts(repo_id=a.repo, private=a.private))
     elif a.cmd == "check-data":
         from .data import build_unified, download_raw
         from .inference import get_cric_score, get_current_matches

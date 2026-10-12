@@ -2,12 +2,15 @@
 
 Predict cricket winners with Apple MLX. Trained on ~27k historical matches, works on live fixtures through CricAPI.
 
+**Pretrained weights (no training needed): [RanveerSoni98/mlx-cric](https://huggingface.co/RanveerSoni98/mlx-cric)**
+
 ## Setup
 
 ```bash
 uv sync
 source .venv/bin/activate
 cp .env.template .env   # drop your CricAPI key in there (free at cricapi.com)
+mlx-cric download-model # one-time pull of weights from HF (predict auto-downloads anyway)
 ```
 
 ## Usage
@@ -17,6 +20,8 @@ mlx-cric upcoming --limit 10     # predict live fixtures
 mlx-cric predict --team1 India --team2 Australia --venue-country India --format ODI
 mlx-cric train --epochs 30 --rebuild
 mlx-cric evaluate
+mlx-cric download-model          # re-pull weights from https://huggingface.co/RanveerSoni98/mlx-cric
+mlx-cric upload-model            # push retrained artifacts/ back to the Hub
 ```
 
 Tests get three-way output since draws are real:

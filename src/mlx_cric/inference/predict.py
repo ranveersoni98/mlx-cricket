@@ -10,7 +10,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from ..config import ARTIFACTS_DIR
+from ..config import ARTIFACTS_DIR, HF_MODEL_REPO
 from .cricapi import fetch_upcoming
 from ..features import FeatureStore, add_chrono_features
 from ..data.hf import load_or_build
@@ -148,10 +148,22 @@ def split_venue(venue: str) -> tuple[str, str]:
 
 
 class Predictor:
-    def __init__(self, artifacts: Path = ARTIFACTS_DIR):
+    def __init__(self, artifacts: Path = ARTIFACTS_DIR, repo_id: str | None = None):
         import json as _json
         import pickle as _pickle
         self.artifacts = Path(artifacts)
+        # First run on a fresh clone: pull pretrained weights from HF Hub
+        # instead of forcing the user to train (~27k matches, slow).
+        if not (self.artifacts / "features.json").exists():
+            try:
+                from ..hub import ensure_artifacts
+                ensure_artifacts(self.artifacts, repo_id=repo_id or HF_MODEL_REPO)
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"No local weights at {self.artifacts} and auto-download "
+                    f"from {repo_id or HF_MODEL_REPO} failed: {e}\n"
+                    f"Run: mlx-cric download-model"
+                ) from e
         self.fs = FeatureStore.load(self.artifacts / "features.json")
         try:
             _cfg = _json.loads((self.artifacts / "model_config.json").read_text())

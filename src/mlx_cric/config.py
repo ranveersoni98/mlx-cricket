@@ -1,4 +1,5 @@
 """Central config for mlx-cric."""
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -6,6 +7,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+
+# Pretrained weights live here. `Predictor` auto-downloads from this repo
+# when local ./artifacts/ is missing, so users never need to train.
+HF_MODEL_REPO = os.environ.get("MLX_CRIC_REPO", "RanveerSoni98/mlx-cric")
 
 # Hugging Face tabular match-result datasets (same schema family)
 HF_DATASETS = {
